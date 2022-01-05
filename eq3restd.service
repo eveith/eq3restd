@@ -1,0 +1,14 @@
+[Unit]
+Description=REST API for eQ3 Radiator Controller
+Requires=network-online.target
+After=network-online.target
+
+[Service]
+User=root
+ExecStart=/opt/eq3-radiator-control/venv/bin/python3 /opt/eq3-radiator-control/venv/bin/uvicorn --app-dir /opt/eq3-radiator-control --log-level info --host 0.0.0.0 eq3restd:app
+PrivateTmp=true
+Restart=on-failure
+WorkingDirectory=/opt/eq3-radiator-control
+
+[Install]
+WantedBy=multi-user.target
