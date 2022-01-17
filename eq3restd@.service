@@ -5,6 +5,8 @@ After=network-online.target
 
 [Service]
 User=root
+EnvironmentFile=-/opt/eq3-radiator-control/eq3restd.env
+Environment="BT_IF=%i"
 ExecStart=/opt/eq3-radiator-control/venv/bin/python3 /opt/eq3-radiator-control/venv/bin/uvicorn --app-dir /opt/eq3-radiator-control --log-level info --host 0.0.0.0 eq3restd:app
 PrivateTmp=true
 Restart=on-failure
