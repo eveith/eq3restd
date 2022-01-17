@@ -13,7 +13,7 @@ import json.decoder
 
 from aiocache import Cache
 from pydantic import BaseModel
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.logger import logger
 from subprocess import run, Popen, TimeoutExpired, PIPE, CalledProcessError
 
@@ -22,14 +22,14 @@ class Temperature(BaseModel):
     setpoint: float
 
 
-BT_IF = "hci1"
+BT_IF = os.environ.get("BT_IF", "hci0")
 EQ3_EXP = "%s/eq3.exp" % os.path.dirname(os.path.realpath(__file__))
+VALUES_MAX_AGE=os.environ.get("VALUES_MAX_AGE", 300)
 
 app = FastAPI()
 cache = Cache()
 refresh_task = None
 thermostats_states = {}
-log = logging.getLogger('eq3restd')
 
 
 def exponential_backoff(func, retries=5):
@@ -45,7 +45,7 @@ def exponential_backoff(func, retries=5):
                 else:
                     result = func(*args, **kwargs)
             except Exception as e:
-                log.warning(
+                logger.warning(
                     "Error executing %s: %s (%d/%d)",
                     func,
                     e,
@@ -62,17 +62,6 @@ def exponential_backoff(func, retries=5):
 @app.on_event("startup")
 def initrand():
     random.seed(None)
-
-
-@app.on_event("startup")
-async def start_background_refresh():
-    refresh_task = asyncio.create_task(_refresh_known_thermostats())
-
-
-@app.on_event("shutdown")
-async def stop_background_query():
-    if refresh_task:
-        refresh_task.cancel()
 
 
 def _reset_hci():
@@ -94,21 +83,33 @@ async def _thermostat_state(hwaddr: str):
         _reset_hci()
         return run([EQ3_EXP, BT_IF, hwaddr, "json"], capture_output=True, check=True)
 
+    cache_key = f"{hwaddr}.state"
+    state = await cache.get(cache_key, dict())
+    if state:
+        return state
+
     try:
         res = await eq3_json(hwaddr)
         state = json.loads(res.stdout)
+        await cache.set(cache_key, state, ttl=VALUES_MAX_AGE)
     except CalledProcessError as e:
-        state = {}
-        log.warning("Could not run eq3.exp %s json: %s", hwaddr, e.stderr)
-    except json.decoder.JSONDecodeError:
-        state = {}
+        logger.error("Could not run eq3.exp %s json: %s", hwaddr, e.stderr)
+        raise e
+    except json.decoder.JSONDecodeError as e:
+        logger.error(
+            "Could not parse JSON from eq3.exp for %s: %s",
+            hwaddr,
+            e.stderr
+        )
+        raise e
     return state
 
 
 async def _set_or_yield_temperature(hwaddr: str, temperature: Temperature):
+    cache_key = f"{hwaddr}.temperature_setpoints"
     now = datetime.datetime.now()
     await asyncio.sleep(5)
-    setpoints = await cache.get('temperature_setpoints') or []
+    setpoints = await cache.get(cache_key) or []
     setpoints = sorted(setpoints, key=lambda x: x[0])
     if setpoints and setpoints[-1][0] <= now:
         _reset_hci()
@@ -116,7 +117,8 @@ async def _set_or_yield_temperature(hwaddr: str, temperature: Temperature):
             [EQ3_EXP, BT_IF, hwaddr, "temp", str(temperature.setpoint)],
             capture_output=True
         )
-        await cache.delete('temperature_setpoints')
+        await cache.delete(cache_key)
+        await cache.delete(f"{hwaddr}.state")
     else:
         res = None
 
@@ -142,26 +144,27 @@ async def thermostats():
 
 @app.get("/thermostats/{hwaddr}")
 async def thermostat_state(hwaddr: str):
-    if hwaddr not in thermostats_states:
-        thermostats_states[hwaddr] = await _thermostat_state(hwaddr)
-    return thermostats_states[hwaddr]
+    return await _thermostat_state(hwaddr)
 
 
 @app.get("/thermostats/{hwaddr}/temperature")
 async def thermostat_current_temprature(hwaddr: str) -> float:
-    if hwaddr not in thermostats_states:
-        thermostats_states[hwaddr] = await _thermostat_state(hwaddr)
-    return thermostats_states[hwaddr].get("temperature", None)
+    try:
+        state = await _thermostat_state(hwaddr)
+        return state.get("temperature", None)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/thermostats/{hwaddr}/temperature")
 async def thermostat_set_temperature(
-        hwaddr: str,
-        temperature: Temperature,
-        background_tasks: BackgroundTasks
-    ):
-    setpoints = await cache.get('temperature_setpoints', default=list())
+    hwaddr: str,
+    temperature: Temperature,
+    background_tasks: BackgroundTasks
+):
+    cache_key = f"{hwaddr}.temperature_setpoints"
+    setpoints = await cache.get(cache_key, default=list())
     setpoints += [(datetime.datetime.now(), temperature.setpoint)]
-    await cache.set('temperature_setpoints', setpoints, ttl=10)
+    await cache.set(cache_key, setpoints, ttl=10)
     background_tasks.add_task(_set_or_yield_temperature, hwaddr, temperature)
     return setpoints
