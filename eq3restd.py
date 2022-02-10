@@ -13,7 +13,7 @@ import json.decoder
 
 from aiocache import Cache
 from pydantic import BaseModel
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Request, BackgroundTasks, HTTPException
 from fastapi.logger import logger
 from subprocess import run, Popen, TimeoutExpired, PIPE, CalledProcessError
 
@@ -24,21 +24,21 @@ class Temperature(BaseModel):
 
 BT_IF = os.environ.get("BT_IF", "hci0")
 EQ3_EXP = "%s/eq3.exp" % os.path.dirname(os.path.realpath(__file__))
-VALUES_MAX_AGE=os.environ.get("VALUES_MAX_AGE", 300)
+VALUES_MAX_AGE=int(os.environ.get("VALUES_MAX_AGE", 300))
 
-app = FastAPI()
+app = FastAPI(debug=True)
 cache = Cache()
 refresh_task = None
 thermostats_states = {}
 
 
-def exponential_backoff(func, retries=5):
+def exponential_backoff(func, retries=3):
     @functools.wraps(func)
     async def _backoff_wrapper(*args, **kwargs):
         error = None
         result = None
         for i in range(retries):
-            await asyncio.sleep(random.randint(0, 2**i - 1))
+            await asyncio.sleep(0.1 * random.randint(0, 2**i - 1))
             try:
                 if inspect.iscoroutinefunction(func):
                     result = await func(*args, **kwargs)
@@ -83,15 +83,24 @@ async def _thermostat_state(hwaddr: str):
         _reset_hci()
         return run([EQ3_EXP, BT_IF, hwaddr, "json"], capture_output=True, check=True)
 
+    now = datetime.datetime.now()
     cache_key = f"{hwaddr}.state"
-    state = await cache.get(cache_key, dict())
-    if state:
-        return state
+    state = await cache.get(cache_key, (dict(), now))
+    if (
+        state[0]
+        and state[1] + datetime.timedelta(seconds=int(VALUES_MAX_AGE)) <= now
+    ):
+        # We have a fresh value cached, don't query again:
+        return state[0]
 
     try:
         res = await eq3_json(hwaddr)
-        state = json.loads(res.stdout)
-        await cache.set(cache_key, state, ttl=VALUES_MAX_AGE)
+        state = (json.loads(res.stdout), now)
+        await cache.set(
+            cache_key,
+            state,  # Data + Timestamp
+            ttl=VALUES_MAX_AGE
+        )
     except CalledProcessError as e:
         logger.error("Could not run eq3.exp %s json: %s", hwaddr, e.stderr)
         raise e
@@ -111,16 +120,18 @@ async def _set_or_yield_temperature(hwaddr: str, temperature: Temperature):
     await asyncio.sleep(5)
     setpoints = await cache.get(cache_key) or []
     setpoints = sorted(setpoints, key=lambda x: x[0])
-    if setpoints and setpoints[-1][0] <= now:
-        _reset_hci()
-        res = run(
-            [EQ3_EXP, BT_IF, hwaddr, "temp", str(temperature.setpoint)],
-            capture_output=True
-        )
-        await cache.delete(cache_key)
-        await cache.delete(f"{hwaddr}.state")
-    else:
-        res = None
+    
+    # If in the meantime another setpoint was issued, or there simply
+    # is nothing to see, sielently yield:
+    if not setpoints and setpoints[-1][0] > now:
+        return
+
+    _reset_hci()
+    run(
+        [EQ3_EXP, BT_IF, hwaddr, "temp", str(temperature.setpoint)]
+    )
+    await cache.delete(cache_key)
+    await cache.delete(f"{hwaddr}.state")
 
 
 @app.get("/thermostats")
@@ -151,9 +162,17 @@ async def thermostat_state(hwaddr: str):
 async def thermostat_current_temprature(hwaddr: str) -> float:
     try:
         state = await _thermostat_state(hwaddr)
-        return state.get("temperature", None)
+        return state[0].get("temperature", None)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        raise HTTPException(
+            status_code=500,
+            detail="".join(
+                traceback.format_exception(
+                    etype=type(e), value=e, tb=e.__traceback__
+                )
+            )
+        )
 
 
 @app.post("/thermostats/{hwaddr}/temperature")
@@ -168,3 +187,16 @@ async def thermostat_set_temperature(
     await cache.set(cache_key, setpoints, ttl=10)
     background_tasks.add_task(_set_or_yield_temperature, hwaddr, temperature)
     return setpoints
+
+@app.exception_handler(Exception)
+async def debug_exception_handler(request: Request, exc: Exception):
+    import traceback
+
+    return Response(
+	content="".join(
+	    traceback.format_exception(
+		etype=type(exc), value=exc, tb=exc.__traceback__
+	    )
+	)
+    )
+
